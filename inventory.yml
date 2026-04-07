@@ -1,0 +1,25 @@
+all:
+  vars:
+    ansible_user: ubuntu
+    ansible_ssh_private_key_file: ~/.ssh/id_rsa
+    volpe_repo: https://github.com/volpe-framework/volpe-application.git
+    volpe_dir: /opt/volpe
+
+  children:
+    volpe_master:
+      hosts:
+        master-node:
+          ansible_host: 192.168.0.2      
+
+    volpe_workers:
+      hosts:
+        worker-1:
+          ansible_host: 192.168.0.3
+          worker_id: worker1
+          worker_memory_gb: 4.0          
+          worker_cpu_count: 4
+        worker-2:
+          ansible_host: 192.168.0.4
+          worker_id: worker2
+          worker_memory_gb: 4.0
+          worker_cpu_count: 4

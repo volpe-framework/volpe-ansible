@@ -1,0 +1,204 @@
+---
+# file: site.yml
+
+- name: Common setup
+  hosts: volpe_master, volpe_workers
+  become: true
+  vars:
+    volpe_repo: https://github.com/volpe-framework/volpe-application.git
+    volpe_dir: /opt/volpe
+    volpe_version: "main"  
+
+  tasks:
+
+    - name: Install podman (Debian/Ubuntu)
+      apt:
+        name:
+          - podman
+          - python3-pip
+        state: present
+        update_cache: true
+      when: ansible_os_family == "Debian"
+
+    - name: Install podman (RedHat/Fedora)
+      dnf:
+        name:
+          - podman
+          - python3-pip
+        state: present
+      when: ansible_os_family == "RedHat"
+
+    - name: Install podman-compose
+      pip:
+        name: podman-compose
+        state: present
+
+    - name: Clone VolPE repo
+      git:
+        repo: "{{ volpe_repo }}"
+        dest: "{{ volpe_dir }}"
+        version: "{{ volpe_version }}"
+        recursive: true
+        update: yes
+
+    - name: Get current user UID
+      command: id -u
+      register: user_uid
+      become: false
+      changed_when: false
+
+    - name: Enable lingering for user
+      command: loginctl enable-linger {{ ansible_user }}
+      ignore_errors: true
+
+    - name: Enable podman socket for user
+      systemd:
+        name: podman.socket
+        enabled: true
+        state: started
+        scope: user
+      become: false
+      ignore_errors: true
+
+
+- name: Deploy master
+  hosts: volpe_master
+  become: true
+  vars:
+    volpe_dir: /opt/volpe
+    master_port: "8000"   
+    grpc_port: "8080"
+
+  tasks:
+
+    - name: Write master override compose file
+      copy:
+        dest: "{{ volpe_dir }}/compose.master.yml"
+        mode: "0644"
+        content: |
+          services:
+            master:
+              build: .  
+              ports:
+                - "{{ grpc_port }}:8080"
+                - "{{ master_port }}:8000"
+              security_opt:
+                - label=disable
+              entrypoint: "./master"
+              devices:
+                - /dev/fuse:/dev/fuse
+              environment:
+                - CONTAINER_HOST=unix:///run/user/{{ user_uid.stdout }}/podman/podman.sock
+              restart: unless-stopped
+
+    - name: Start master
+      command:
+        cmd: podman-compose -f compose.master.yml up -d --build
+        chdir: "{{ volpe_dir }}"
+      changed_when: true
+
+    - name: Wait for master port
+      wait_for:
+        port: "{{ grpc_port }}"
+        host: 0.0.0.0
+        timeout: 120
+
+
+- name: Deploy workers
+  hosts: volpe_workers
+  become: true
+  vars:
+    volpe_dir: /opt/volpe
+    master_ip: "{{ hostvars[groups['volpe_master'][0]]['ansible_default_ipv4']['address'] }}"
+    master_grpc_port: "8080"
+
+  tasks:
+
+    - name: Validate worker vars
+      assert:
+        that:
+          - worker_id is defined
+          - worker_memory_gb is defined
+          - worker_cpu_count is defined
+
+    - name: Create config dir
+      file:
+        path: "{{ volpe_dir }}/compose_configs"
+        state: directory
+        mode: "0755"
+
+    - name: Write worker config
+      copy:
+        dest: "{{ volpe_dir }}/compose_configs/{{ worker_id }}.ini"
+        mode: "0644"
+        content: |
+          [general]
+          worker_id={{ worker_id }}
+          volpe_master={{ master_ip }}:{{ master_grpc_port }}
+
+          [resources]
+          memory_gb={{ worker_memory_gb }}
+          cpu_count={{ worker_cpu_count }}
+
+    - name: Write worker compose file
+      copy:
+        dest: "{{ volpe_dir }}/compose.worker.yml"
+        mode: "0644"
+        content: |
+          services:
+            worker:
+              build: .  
+              security_opt:
+                - label=disable
+              volumes:
+                - {{ volpe_dir }}/compose_configs/{{ worker_id }}.ini:/home/podman/config.ini
+              entrypoint: "./worker -config-path ./config.ini"
+              devices:
+                - /dev/fuse:/dev/fuse
+              environment:
+                - CONTAINER_HOST=unix:///run/user/{{ user_uid.stdout }}/podman/podman.sock
+              restart: unless-stopped
+
+    - name: Start worker
+      command:
+        cmd: podman-compose -f compose.worker.yml up -d --build
+        chdir: "{{ volpe_dir }}"
+      changed_when: true
+
+    - name: Check worker
+      command:
+        cmd: podman-compose -f compose.worker.yml ps
+        chdir: "{{ volpe_dir }}"
+      register: worker_ps
+      changed_when: false
+
+    - name: Show worker status
+      debug:
+        msg: "{{ worker_ps.stdout_lines }}"
+
+
+- name: Teardown master
+  hosts: volpe_master
+  become: true
+  vars:
+    volpe_dir: /opt/volpe
+  tags: [teardown, never]
+  tasks:
+    - name: Stop master
+      command:
+        cmd: podman-compose -f compose.master.yml down
+        chdir: "{{ volpe_dir }}"
+      changed_when: true
+
+- name: Teardown workers
+  hosts: volpe_workers
+  become: true
+  vars:
+    volpe_dir: /opt/volpe
+  tags: [teardown, never]
+  tasks:
+    - name: Stop worker
+      command:
+        cmd: podman-compose -f compose.worker.yml down
+        chdir: "{{ volpe_dir }}"
+      changed_when: true
