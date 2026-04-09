@@ -52,6 +52,9 @@ ssh-keygen
 ssh-copy-id user@<node-ip>
 ```
 
+## Confirm SSH works
+```ansible -i inventory.yml all -m ping```
+
 ## Deployment
 
 ### Dry Run
