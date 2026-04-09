@@ -1,25 +1,31 @@
 all:
   vars:
-    ansible_user: ubuntu
-    ansible_ssh_private_key_file: ~/.ssh/id_rsa
+    #find user of each system and fill ansible_user (ex: ubuntu, admin, user)
+    ansible_user: ubuntu                              
+    ansible_ssh_private_key_file: ~/.ssh/id_rsa       
+    volpe_dir: /opt/volpe                             
     volpe_repo: https://github.com/volpe-framework/volpe-application.git
-    volpe_dir: /opt/volpe
+    volpe_version: main
 
   children:
+
+    #find ip address of master system and fill
     volpe_master:
       hosts:
         master-node:
-          ansible_host: 192.168.0.2      
+          ansible_host: #placeholder                
 
+    #find ip address of each worker system and fill in placeholder 
     volpe_workers:
       hosts:
         worker-1:
-          ansible_host: 192.168.0.3
-          worker_id: worker1
-          worker_memory_gb: 4.0          
-          worker_cpu_count: 4
+          ansible_host:  #placeholder                
+          worker_id: worker1                         
+          worker_memory_gb: 4.0                      
+          worker_cpu_count: 4                        
+
         worker-2:
-          ansible_host: 192.168.0.4
+          ansible_host: #placeholder 
           worker_id: worker2
           worker_memory_gb: 4.0
           worker_cpu_count: 4

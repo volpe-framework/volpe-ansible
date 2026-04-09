@@ -1,0 +1,21 @@
+all:
+  vars:
+    ansible_connection: local       
+    ansible_user: "{{ lookup('env', 'USER') }}"  
+    volpe_dir: /tmp/volpe-test      
+    volpe_repo: https://github.com/volpe-framework/volpe-application.git
+    volpe_version: main
+
+  children:
+    volpe_master:
+      hosts:
+        localhost:
+          ansible_host: localhost
+
+    volpe_workers:
+      hosts:
+        localhost:                  
+          ansible_host: localhost
+          worker_id: worker-local
+          worker_memory_gb: 2.0
+          worker_cpu_count: 2

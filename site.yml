@@ -1,133 +1,169 @@
----
-# file: site.yml
-
-- name: Common setup
+- name: Common setup (all nodes)
   hosts: volpe_master, volpe_workers
-  become: true
   vars:
     volpe_repo: https://github.com/volpe-framework/volpe-application.git
     volpe_dir: /opt/volpe
-    volpe_version: "main"  
+    volpe_version: main
 
   tasks:
-
-    - name: Install podman (Debian/Ubuntu)
+    - name: Install podman + pip + git (Debian/Ubuntu)
+      become: true
       apt:
         name:
           - podman
           - python3-pip
+          - git
         state: present
         update_cache: true
       when: ansible_os_family == "Debian"
 
-    - name: Install podman (RedHat/Fedora)
+    - name: Install podman + pip + git (RedHat/Fedora/CentOS)
+      become: true
       dnf:
         name:
           - podman
           - python3-pip
+          - git
         state: present
       when: ansible_os_family == "RedHat"
 
-    - name: Install podman-compose
+    - name: Install podman-compose via pip
+      become: true
       pip:
         name: podman-compose
         state: present
+        break_system_packages: true
 
-    - name: Clone VolPE repo
+
+    - name: Create volpe directory owned by ansible_user
+      become: true
+      file:
+        path: "{{ volpe_dir }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0755"
+
+
+    - name: Enable systemd linger for ansible_user
+      become: true
+      command: "loginctl enable-linger {{ ansible_user }}"
+      args:
+        creates: "/var/lib/systemd/linger/{{ ansible_user }}"
+      when: ansible_service_mgr == "systemd"
+
+
+    - name: Clone VolPE repository
+      become: false
       git:
         repo: "{{ volpe_repo }}"
         dest: "{{ volpe_dir }}"
         version: "{{ volpe_version }}"
-        recursive: true
-        update: yes
+        recursive: true        
+        update: true
+        accept_hostkey: true   
 
-    - name: Get current user UID
+    - name: Get UID of ansible_user
       command: id -u
-      register: user_uid
+      register: ansible_user_uid
       become: false
       changed_when: false
 
-    - name: Enable lingering for user
-      command: loginctl enable-linger {{ ansible_user }}
-      ignore_errors: true
-
-    - name: Enable podman socket for user
+    - name: Enable and start podman socket for user
+      become: false
       systemd:
         name: podman.socket
         enabled: true
         state: started
         scope: user
-      become: false
+      when: ansible_service_mgr == "systemd"
       ignore_errors: true
 
 
-- name: Deploy master
+- name: Deploy VolPE master
   hosts: volpe_master
-  become: true
   vars:
     volpe_dir: /opt/volpe
-    master_port: "8000"   
-    grpc_port: "8080"
+    master_api_port: "8000"
+    master_grpc_port: "8080"
 
   tasks:
 
-    - name: Write master override compose file
+    - name: Get UID of ansible_user
+      command: id -u
+      register: ansible_user_uid
+      become: false
+      changed_when: false
+
+    - name: Write master compose override file
+      become: false
       copy:
         dest: "{{ volpe_dir }}/compose.master.yml"
         mode: "0644"
         content: |
           services:
             master:
-              build: .  
+              build: .
               ports:
-                - "{{ grpc_port }}:8080"
-                - "{{ master_port }}:8000"
+                - "{{ master_grpc_port }}:8080"
+                - "{{ master_api_port }}:8000"
               security_opt:
                 - label=disable
               entrypoint: "./master"
               devices:
                 - /dev/fuse:/dev/fuse
               environment:
-                - CONTAINER_HOST=unix:///run/user/{{ user_uid.stdout }}/podman/podman.sock
+                - CONTAINER_HOST=unix:///run/user/{{ ansible_user_uid.stdout }}/podman/podman.sock
               restart: unless-stopped
 
-    - name: Start master
+    - name: Build and start master
+      become: false
       command:
         cmd: podman-compose -f compose.master.yml up -d --build
         chdir: "{{ volpe_dir }}"
       changed_when: true
 
-    - name: Wait for master port
+    - name: Wait for master gRPC port to be ready
       wait_for:
-        port: "{{ grpc_port }}"
+        port: "{{ master_grpc_port }}"
         host: 0.0.0.0
-        timeout: 120
+        timeout: 180
+        delay: 5
+
+    - name: Confirm master API is reachable
+      uri:
+        url: "http://localhost:{{ master_api_port }}/problems"
+        status_code: 200
+      retries: 10
+      delay: 5
+      register: api_check
+      until: api_check.status == 200
 
 
-- name: Deploy workers
+- name: Deploy VolPE workers
   hosts: volpe_workers
-  become: true
   vars:
     volpe_dir: /opt/volpe
-    master_ip: "{{ hostvars[groups['volpe_master'][0]]['ansible_default_ipv4']['address'] }}"
     master_grpc_port: "8080"
+    master_ip: "{{ hostvars[groups['volpe_master'][0]]['ansible_default_ipv4']['address'] }}"
 
   tasks:
 
-    - name: Validate worker vars
-      assert:
-        that:
-          - worker_id is defined
-          - worker_memory_gb is defined
-          - worker_cpu_count is defined
+    - name: Get UID of ansible_user
+      command: id -u
+      register: ansible_user_uid
+      become: false
+      changed_when: false
 
-    - name: Create config dir
+    - name: Ensure compose_configs directory exists
+      become: false
       file:
         path: "{{ volpe_dir }}/compose_configs"
         state: directory
         mode: "0755"
 
-    - name: Write worker config
+    - name: Write worker config .ini
+      become: false
       copy:
         dest: "{{ volpe_dir }}/compose_configs/{{ worker_id }}.ini"
         mode: "0644"
@@ -140,14 +176,15 @@
           memory_gb={{ worker_memory_gb }}
           cpu_count={{ worker_cpu_count }}
 
-    - name: Write worker compose file
+    - name: Write worker compose override file
+      become: false
       copy:
         dest: "{{ volpe_dir }}/compose.worker.yml"
         mode: "0644"
         content: |
           services:
             worker:
-              build: .  
+              build: .
               security_opt:
                 - label=disable
               volumes:
@@ -156,35 +193,38 @@
               devices:
                 - /dev/fuse:/dev/fuse
               environment:
-                - CONTAINER_HOST=unix:///run/user/{{ user_uid.stdout }}/podman/podman.sock
+                - CONTAINER_HOST=unix:///run/user/{{ ansible_user_uid.stdout }}/podman/podman.sock
               restart: unless-stopped
 
-    - name: Start worker
+    - name: Build and start worker
+      become: false
       command:
         cmd: podman-compose -f compose.worker.yml up -d --build
         chdir: "{{ volpe_dir }}"
       changed_when: true
 
-    - name: Check worker
+    - name: Verify worker container is running
+      become: false
       command:
         cmd: podman-compose -f compose.worker.yml ps
         chdir: "{{ volpe_dir }}"
-      register: worker_ps
+      register: worker_status
       changed_when: false
 
-    - name: Show worker status
+    - name: Print worker status
       debug:
-        msg: "{{ worker_ps.stdout_lines }}"
+        msg: "{{ worker_status.stdout_lines }}"
+
 
 
 - name: Teardown master
   hosts: volpe_master
-  become: true
+  tags: [teardown, never]
   vars:
     volpe_dir: /opt/volpe
-  tags: [teardown, never]
   tasks:
-    - name: Stop master
+    - name: Stop and remove master containers
+      become: false
       command:
         cmd: podman-compose -f compose.master.yml down
         chdir: "{{ volpe_dir }}"
@@ -192,12 +232,12 @@
 
 - name: Teardown workers
   hosts: volpe_workers
-  become: true
+  tags: [teardown, never]
   vars:
     volpe_dir: /opt/volpe
-  tags: [teardown, never]
   tasks:
-    - name: Stop worker
+    - name: Stop and remove worker containers
+      become: false
       command:
         cmd: podman-compose -f compose.worker.yml down
         chdir: "{{ volpe_dir }}"
