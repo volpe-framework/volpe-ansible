@@ -4,37 +4,76 @@
     volpe_repo: https://github.com/volpe-framework/volpe-application.git
     volpe_dir: /opt/volpe
     volpe_version: main
+    go_version: "1.24.2"
+    go_tarball: "go{{ go_version }}.linux-{{ go_arch }}.tar.gz"
+    go_url: "https://go.dev/dl/{{ go_tarball }}"
 
   tasks:
-    - name: Install Go + podman + git (Debian/Ubuntu)
+    - name: Set Go architecture fact
+      set_fact:
+        go_arch: >-
+          {{ 'amd64' if ansible_facts['architecture'] == 'x86_64'
+             else 'arm64' if ansible_facts['architecture'] in ['aarch64', 'arm64']
+             else 'amd64' }}
+
+    - name: Download Go tarball
+      become: true
+      get_url:
+        url: "{{ go_url }}"
+        dest: "/tmp/{{ go_tarball }}"
+        mode: "0644"
+
+    - name: Remove existing Go installation
+      become: true
+      file:
+        path: /usr/local/go
+        state: absent
+
+    - name: Extract Go tarball to /usr/local
+      become: true
+      unarchive:
+        src: "/tmp/{{ go_tarball }}"
+        dest: /usr/local
+        remote_src: true
+
+    - name: Install system dependencies (Debian/Ubuntu)
       become: true
       apt:
         name:
-          - golang-go
           - podman
           - git
+          - pkg-config
+          - libgpgme-dev
+          - libbtrfs-dev
+          - libdevmapper-dev
+          - build-essential
         state: present
         update_cache: true
-      when: ansible_os_family == "Debian"
+      when: ansible_facts['os_family'] == "Debian"
 
-    - name: Install Go + podman + git (RedHat/Fedora/CentOS)
+    - name: Install system dependencies (RedHat/Fedora/CentOS)
       become: true
       dnf:
         name:
-          - golang
           - podman
           - git
+          - pkgconf-pkg-config
+          - gpgme-devel
+          - btrfs-progs-devel
+          - device-mapper-devel
+          - gcc
+          - make
         state: present
-      when: ansible_os_family == "RedHat"
+      when: ansible_facts['os_family'] == "RedHat"
 
     - name: Check Go version
-      command: go version
-      register: go_version
+      command: /usr/local/go/bin/go version
+      register: go_version_output
       changed_when: false
 
     - name: Show Go version
       debug:
-        msg: "{{ go_version.stdout }}"
+        msg: "{{ go_version_output.stdout }}"
 
     - name: Get user account details
       become: true
@@ -44,11 +83,7 @@
 
     - name: Set home directory fact
       set_fact:
-        user_home: "{{ getent_passwd[ansible_user][5] }}"
-
-    - name: Show resolved home directory
-      debug:
-        msg: "HOME will be set to: {{ user_home }}"
+        user_home: "{{ getent_passwd[ansible_user][4] }}"
 
     - name: Create volpe directory owned by ansible_user
       become: true
@@ -64,7 +99,7 @@
       command: "loginctl enable-linger {{ ansible_user }}"
       args:
         creates: "/var/lib/systemd/linger/{{ ansible_user }}"
-      when: ansible_service_mgr == "systemd"
+      when: ansible_facts['service_mgr'] == "systemd"
 
     - name: Get ansible_user uid
       command: "id -u {{ ansible_user }}"
@@ -80,10 +115,6 @@
       register: podman_socket_enable
       changed_when: false
       failed_when: podman_socket_enable.rc != 0
-
-    - name: Show podman socket enable output
-      debug:
-        msg: "{{ podman_socket_enable.stdout_lines }}"
 
     - name: Wait for podman socket to be ready
       wait_for:
@@ -110,11 +141,6 @@
       set_fact:
         podman_socket: "unix://{{ podman_sock_raw.stdout }}"
 
-    - name: Show resolved podman socket path
-      debug:
-        msg: "CONTAINER_HOST will be set to: {{ podman_socket }}"
-
-
 - name: Deploy VolPE master
   hosts: volpe_master
   vars:
@@ -132,33 +158,8 @@
       loop:
         - "{{ master_api_port }}"
         - "{{ master_grpc_port }}"
-      when: ansible_os_family == "Debian"
-      register: ufw_result
+      when: ansible_facts['os_family'] == "Debian"
       ignore_errors: true
-
-    - name: Show UFW result
-      debug:
-        msg: "{{ ufw_result }}"
-      when: ansible_os_family == "Debian"
-
-    - name: Open master ports in firewalld (RedHat/CentOS)
-      become: true
-      firewalld:
-        port: "{{ item }}/tcp"
-        permanent: true
-        state: enabled
-        immediate: true
-      loop:
-        - "{{ master_api_port }}"
-        - "{{ master_grpc_port }}"
-      when: ansible_os_family == "RedHat"
-      register: firewalld_result
-      ignore_errors: true
-
-    - name: Show firewalld result
-      debug:
-        msg: "{{ firewalld_result }}"
-      when: ansible_os_family == "RedHat"
 
     - name: Install volpe-master systemd service
       become: true
@@ -180,6 +181,8 @@
           User={{ ansible_user }}
           Environment="HOME={{ user_home }}"
           Environment="CONTAINER_HOST={{ podman_socket }}"
+          Environment="PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          Environment="CGO_ENABLED=1"
 
           [Install]
           WantedBy=multi-user.target
@@ -200,13 +203,26 @@
       wait_for:
         port: "{{ master_api_port }}"
         host: localhost
-        timeout: 120
-        delay: 5
+        timeout: 180
+        delay: 10
       register: port_wait
+      ignore_errors: true
 
-    - name: Show port wait result
+    - name: Dump master service journal (last 50 lines)
+      become: true
+      command: journalctl -u volpe-master -n 50 --no-pager
+      register: master_journal
+      changed_when: false
+      failed_when: false
+
+    - name: Print master journal
       debug:
-        var: port_wait
+        msg: "{{ master_journal.stdout_lines }}"
+
+    - name: Fail here if port never opened
+      fail:
+        msg: "Master API port {{ master_api_port }} did not open within 180s — check journal above"
+      when: port_wait is failed
 
     - name: Confirm master API is reachable
       uri:
@@ -217,22 +233,6 @@
       register: api_check
       until: api_check.status == 200
 
-    - name: Show API check result
-      debug:
-        var: api_check
-
-    - name: Show master service status
-      become: true
-      command: systemctl status volpe-master
-      register: master_status
-      changed_when: false
-      failed_when: false
-
-    - name: Print master service status
-      debug:
-        msg: "{{ master_status.stdout_lines }}"
-
-
 - name: Deploy VolPE workers
   hosts: volpe_workers
   vars:
@@ -241,14 +241,11 @@
     master_ip: "{{ hostvars[groups['volpe_master'][0]]['ansible_default_ipv4']['address'] }}"
 
   tasks:
-    - name: Pre-flight — verify master gRPC port is reachable from this worker
+    - name: Pre-flight — verify master gRPC port is reachable
       wait_for:
         host: "{{ master_ip }}"
         port: "{{ master_grpc_port }}"
         timeout: 60
-        msg: >
-          Worker cannot reach master at {{ master_ip }}:{{ master_grpc_port }}.
-          Check firewall rules on the master node.
 
     - name: Install volpe-worker systemd service
       become: true
@@ -271,6 +268,8 @@
           Environment="HOME={{ user_home }}"
           Environment="VOLPE_MASTER={{ master_ip }}:{{ master_grpc_port }}"
           Environment="CONTAINER_HOST={{ podman_socket }}"
+          Environment="PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          Environment="CGO_ENABLED=1"
 
           [Install]
           WantedBy=multi-user.target
@@ -287,22 +286,16 @@
         state: started
         enabled: true
 
-    - name: Check volpe-worker service status
+    - name: Dump worker journal
       become: true
-      command: systemctl status volpe-worker
-      register: worker_status
+      command: journalctl -u volpe-worker -n 50 --no-pager
+      register: worker_journal
       changed_when: false
       failed_when: false
 
-    - name: Print worker service status
+    - name: Print worker journal
       debug:
-        msg: "{{ worker_status.stdout_lines }}"
-
-    - name: Print worker service stderr (if any)
-      debug:
-        msg: "{{ worker_status.stderr_lines }}"
-      when: worker_status.stderr_lines | length > 0
-
+        msg: "{{ worker_journal.stdout_lines }}"
 
 - name: Teardown master
   hosts: volpe_master
