@@ -31,7 +31,7 @@
       changed_when: false
       failed_when: false
 
-    - name: Install Go {{ go_version }} (skipped if already current)
+    - name: Install Go {{ go_version }}
       when: >
         installed_go.rc != 0 or
         ('go' + go_version) not in installed_go.stdout
@@ -60,10 +60,6 @@
       command: /usr/local/go/bin/go version
       register: go_version_output
       changed_when: false
-
-    - name: Show Go version
-      debug:
-        msg: "{{ go_version_output.stdout }}"
 
     - name: Install system dependencies (Debian/Ubuntu)
       become: true
@@ -155,13 +151,6 @@
       set_fact:
         podman_socket: "unix://{{ podman_sock_raw.stdout }}"
 
-    - name: Show resolved facts
-      debug:
-        msg:
-          - "user_home : {{ user_home }}"
-          - "podman    : {{ podman_socket }}"
-          - "go        : {{ go_version_output.stdout }}"
-
 - name: Deploy VolPE master
   hosts: volpe_master
   vars:
@@ -245,13 +234,9 @@
       changed_when: false
       failed_when: false
 
-    - name: Print master journal
-      debug:
-        msg: "{{ master_journal.stdout_lines }}"
-
     - name: Fail if master port never opened
       fail:
-        msg: "Master API port {{ master_api_port }} did not open — check journal output above"
+        msg: "Master API port {{ master_api_port }} did not open"
       when: port_wait is failed
 
     - name: Confirm master API is reachable
@@ -262,10 +247,6 @@
       delay: 5
       register: api_check
       until: api_check.status == 200
-
-    - name: Show API check result
-      debug:
-        var: api_check
 
 - name: Deploy VolPE workers
   hosts: volpe_workers
@@ -280,7 +261,22 @@
         host: "{{ master_ip }}"
         port: "{{ master_grpc_port }}"
         timeout: 60
-        msg: "Cannot reach master at {{ master_ip }}:{{ master_grpc_port }} — check firewall on master node"
+
+    - name: Write worker config.ini
+      become: true
+      copy:
+        dest: "{{ volpe_dir }}/worker/config.ini"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0644"
+        content: |
+          [general]
+          volpe_master={{ master_ip }}:{{ master_grpc_port }}
+          worker_id={{ inventory_hostname }}
+
+          [resources]
+          memory_gb={{ worker_memory_gb | default(2.0) }}
+          cpu_count={{ worker_cpu_count | default(2) }}
 
     - name: Install volpe-worker systemd service
       become: true
@@ -293,7 +289,7 @@
           After=network.target
           
           [Service]
-          ExecStart=/usr/bin/env go run .
+          ExecStart=/usr/bin/env go run . -config-path {{ volpe_dir }}/worker/config.ini
           WorkingDirectory={{ volpe_dir }}/worker
           Restart=always
           RestartSec=10
@@ -301,7 +297,6 @@
           StartLimitBurst=5
           User={{ ansible_user }}
           Environment="HOME={{ user_home }}"
-          Environment="VOLPE_MASTER={{ master_ip }}:{{ master_grpc_port }}"
           Environment="CONTAINER_HOST={{ podman_socket }}"
           Environment="PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
           Environment="CGO_ENABLED=1"
@@ -323,10 +318,6 @@
       register: worker_journal
       changed_when: false
       failed_when: false
-
-    - name: Print worker journal
-      debug:
-        msg: "{{ worker_journal.stdout_lines }}"
 
 - name: Teardown master
   hosts: volpe_master
