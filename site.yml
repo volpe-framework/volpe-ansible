@@ -5,36 +5,65 @@
     volpe_dir: /opt/volpe
     volpe_version: main
     go_version: "1.24.2"
-    go_tarball: "go{{ go_version }}.linux-{{ go_arch }}.tar.gz"
-    go_url: "https://go.dev/dl/{{ go_tarball }}"
 
   tasks:
-    - name: Set Go architecture fact
+    - name: Get user account details
+      getent:
+        database: passwd
+        key: "{{ ansible_user }}"
+
+    - name: Set user home and Go arch facts
       set_fact:
+        user_home: "{{ getent_passwd[ansible_user][4] }}"
         go_arch: >-
           {{ 'amd64' if ansible_facts['architecture'] == 'x86_64'
              else 'arm64' if ansible_facts['architecture'] in ['aarch64', 'arm64']
              else 'amd64' }}
 
-    - name: Download Go tarball
-      become: true
-      get_url:
-        url: "{{ go_url }}"
-        dest: "/tmp/{{ go_tarball }}"
-        mode: "0644"
+    - name: Set Go download URL facts
+      set_fact:
+        go_tarball: "go{{ go_version }}.linux-{{ go_arch }}.tar.gz"
+        go_url: "https://go.dev/dl/go{{ go_version }}.linux-{{ go_arch }}.tar.gz"
 
-    - name: Remove existing Go installation
-      become: true
-      file:
-        path: /usr/local/go
-        state: absent
+    - name: Check installed Go version
+      command: /usr/local/go/bin/go version
+      register: installed_go
+      changed_when: false
+      failed_when: false
 
-    - name: Extract Go tarball to /usr/local
-      become: true
-      unarchive:
-        src: "/tmp/{{ go_tarball }}"
-        dest: /usr/local
-        remote_src: true
+    - name: Install Go {{ go_version }} (skipped if already current)
+      when: >
+        installed_go.rc != 0 or
+        ('go' + go_version) not in installed_go.stdout
+      block:
+        - name: Download Go tarball
+          become: true
+          get_url:
+            url: "{{ go_url }}"
+            dest: "/tmp/{{ go_tarball }}"
+            mode: "0644"
+
+        - name: Remove existing Go installation
+          become: true
+          file:
+            path: /usr/local/go
+            state: absent
+
+        - name: Extract Go to /usr/local
+          become: true
+          unarchive:
+            src: "/tmp/{{ go_tarball }}"
+            dest: /usr/local
+            remote_src: true
+
+    - name: Verify Go version
+      command: /usr/local/go/bin/go version
+      register: go_version_output
+      changed_when: false
+
+    - name: Show Go version
+      debug:
+        msg: "{{ go_version_output.stdout }}"
 
     - name: Install system dependencies (Debian/Ubuntu)
       become: true
@@ -46,6 +75,7 @@
           - libgpgme-dev
           - libbtrfs-dev
           - libdevmapper-dev
+          - libseccomp-dev
           - build-essential
         state: present
         update_cache: true
@@ -61,31 +91,13 @@
           - gpgme-devel
           - btrfs-progs-devel
           - device-mapper-devel
+          - libseccomp-devel
           - gcc
           - make
         state: present
       when: ansible_facts['os_family'] == "RedHat"
 
-    - name: Check Go version
-      command: /usr/local/go/bin/go version
-      register: go_version_output
-      changed_when: false
-
-    - name: Show Go version
-      debug:
-        msg: "{{ go_version_output.stdout }}"
-
-    - name: Get user account details
-      become: true
-      getent:
-        database: passwd
-        key: "{{ ansible_user }}"
-
-    - name: Set home directory fact
-      set_fact:
-        user_home: "{{ getent_passwd[ansible_user][4] }}"
-
-    - name: Create volpe directory owned by ansible_user
+    - name: Create VolPE directory
       become: true
       file:
         path: "{{ volpe_dir }}"
@@ -99,7 +111,6 @@
       command: "loginctl enable-linger {{ ansible_user }}"
       args:
         creates: "/var/lib/systemd/linger/{{ ansible_user }}"
-      when: ansible_facts['service_mgr'] == "systemd"
 
     - name: Get ansible_user uid
       command: "id -u {{ ansible_user }}"
@@ -116,13 +127,12 @@
       changed_when: false
       failed_when: podman_socket_enable.rc != 0
 
-    - name: Wait for podman socket to be ready
+    - name: Wait for podman socket file to exist
       wait_for:
         path: "/run/user/{{ user_uid.stdout }}/podman/podman.sock"
         timeout: 30
 
     - name: Clone VolPE repository
-      become: false
       git:
         repo: "{{ volpe_repo }}"
         dest: "{{ volpe_dir }}"
@@ -132,14 +142,25 @@
         accept_hostkey: true
 
     - name: Get podman socket path
-      become: false
+      become: true
+      become_user: "{{ ansible_user }}"
       command: podman info -f "{{ '{{' }}.Host.RemoteSocket.Path{{ '}}' }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ user_uid.stdout }}"
       register: podman_sock_raw
       changed_when: false
+      failed_when: podman_sock_raw.rc != 0
 
     - name: Set podman socket fact
       set_fact:
         podman_socket: "unix://{{ podman_sock_raw.stdout }}"
+
+    - name: Show resolved facts
+      debug:
+        msg:
+          - "user_home : {{ user_home }}"
+          - "podman    : {{ podman_socket }}"
+          - "go        : {{ go_version_output.stdout }}"
 
 - name: Deploy VolPE master
   hosts: volpe_master
@@ -161,6 +182,19 @@
       when: ansible_facts['os_family'] == "Debian"
       ignore_errors: true
 
+    - name: Open master ports in firewalld (RedHat/Fedora)
+      become: true
+      ansible.posix.firewalld:
+        port: "{{ item }}/tcp"
+        permanent: true
+        state: enabled
+        immediate: true
+      loop:
+        - "{{ master_api_port }}"
+        - "{{ master_grpc_port }}"
+      when: ansible_facts['os_family'] == "RedHat"
+      ignore_errors: true
+
     - name: Install volpe-master systemd service
       become: true
       copy:
@@ -170,7 +204,7 @@
           [Unit]
           Description=VolPE Master
           After=network.target
-
+          
           [Service]
           ExecStart=/usr/bin/env go run .
           WorkingDirectory={{ volpe_dir }}/master
@@ -187,19 +221,15 @@
           [Install]
           WantedBy=multi-user.target
 
-    - name: Reload systemd daemon
-      become: true
-      systemd:
-        daemon_reload: true
-
-    - name: Enable and start volpe-master
+    - name: Start volpe-master
       become: true
       systemd:
         name: volpe-master
         state: started
+        daemon_reload: true
         enabled: true
 
-    - name: Wait for master API port to be ready
+    - name: Wait for master API port
       wait_for:
         port: "{{ master_api_port }}"
         host: localhost
@@ -208,7 +238,7 @@
       register: port_wait
       ignore_errors: true
 
-    - name: Dump master service journal (last 50 lines)
+    - name: Dump master journal
       become: true
       command: journalctl -u volpe-master -n 50 --no-pager
       register: master_journal
@@ -219,9 +249,9 @@
       debug:
         msg: "{{ master_journal.stdout_lines }}"
 
-    - name: Fail here if port never opened
+    - name: Fail if master port never opened
       fail:
-        msg: "Master API port {{ master_api_port }} did not open within 180s — check journal above"
+        msg: "Master API port {{ master_api_port }} did not open — check journal output above"
       when: port_wait is failed
 
     - name: Confirm master API is reachable
@@ -233,12 +263,16 @@
       register: api_check
       until: api_check.status == 200
 
+    - name: Show API check result
+      debug:
+        var: api_check
+
 - name: Deploy VolPE workers
   hosts: volpe_workers
   vars:
     volpe_dir: /opt/volpe
     master_grpc_port: "8080"
-    master_ip: "{{ hostvars[groups['volpe_master'][0]]['ansible_default_ipv4']['address'] }}"
+    master_ip: "{{ hostvars[groups['volpe_master'][0]]['ansible_host'] }}"
 
   tasks:
     - name: Pre-flight — verify master gRPC port is reachable
@@ -246,6 +280,7 @@
         host: "{{ master_ip }}"
         port: "{{ master_grpc_port }}"
         timeout: 60
+        msg: "Cannot reach master at {{ master_ip }}:{{ master_grpc_port }} — check firewall on master node"
 
     - name: Install volpe-worker systemd service
       become: true
@@ -256,7 +291,7 @@
           [Unit]
           Description=VolPE Worker
           After=network.target
-
+          
           [Service]
           ExecStart=/usr/bin/env go run .
           WorkingDirectory={{ volpe_dir }}/worker
@@ -274,16 +309,12 @@
           [Install]
           WantedBy=multi-user.target
 
-    - name: Reload systemd daemon
-      become: true
-      systemd:
-        daemon_reload: true
-
-    - name: Enable and start volpe-worker
+    - name: Start volpe-worker
       become: true
       systemd:
         name: volpe-worker
         state: started
+        daemon_reload: true
         enabled: true
 
     - name: Dump worker journal
