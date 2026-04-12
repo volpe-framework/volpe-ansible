@@ -64,8 +64,9 @@ ansible-playbook -i inventory.yml site.yml --check
 
 ### Run Deployment
 ```bash
-ansible-playbook -i inventory.yml site.yml
+ansible-playbook -i inventory.yml site.yml -K
 ```
+Enter the password when prompter
 
 ## Verification
 
