@@ -6,7 +6,7 @@ This setup automates the deployment of VolPE across multiple machines using Ansi
 
 ```bash
 pip install ansible
-git clone <your-repo-url>
+git clone https://github.com/volpe-framework/volpe-ansible.git
 cd volpe-ansible
 ```
 
